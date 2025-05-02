@@ -111,11 +111,10 @@ bool EntropicEquilibrium::compute(NodeData& node, const Lattice& lattice, int ma
     for (int i = 0; i < Q; ++i) {
         Real L = state.lambda[0] + state.lambda[1] * c[i].x + state.lambda[2] * c[i].y;
         node.f_eq[i] = w[i] * std::exp(L);
-        // Check for negative f_eq (shouldn't happen with exp)
-        if (node.f_eq[i] < 0.0) {
-             std::cerr << "Error: Negative f_eq[" << i << "] = " << node.f_eq[i] << " computed!" << std::endl;
-             node.f_eq[i] = REAL_EPSILON; // Force positivity? Or return false.
-             // return false;
+        // Check for negative f_eq (shouldn't happen with exp, but clamp for safety)
+        if (node.f_eq[i] <= 0.0) {
+             // std::cerr << "Warning: Non-positive f_eq[" << i << "] = " << node.f_eq[i] << " computed! Clamping." << std::endl;
+             node.f_eq[i] = REAL_EPSILON; // Force positivity
         }
     }
     return true; // Success

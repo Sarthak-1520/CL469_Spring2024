@@ -12,7 +12,7 @@
 class Simulator {
 public:
     // Constructor takes simulation parameters
-    Simulator(int nx, int ny, Real viscosity, Real lid_velocity, int total_steps, int output_freq);
+    Simulator(int nx, int ny, Real viscosity, Real inlet_velocity, int total_steps, int output_freq);
 
     void run();
 
@@ -20,7 +20,7 @@ private:
     // Parameters
     int nx, ny;
     Real viscosity;
-    Real lid_velocity;
+    Real inlet_velocity; // Renamed from lid_velocity
     int total_steps;
     int output_freq;
     Real tau; // Relaxation time
@@ -37,6 +37,7 @@ private:
 
     // Initialization
     void initialize_grid();
+    void setup_boundaries(Real ellipse_cx, Real ellipse_cy, Real ellipse_a, Real ellipse_b); // Pass ellipse params
     void setup_boundaries(); // Mark boundary nodes
 
     // Main loop steps

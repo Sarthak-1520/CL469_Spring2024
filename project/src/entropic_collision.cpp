@@ -25,14 +25,9 @@ Real EntropicCollision::AlphaObjective::operator()(Real alpha) const {
     bool non_positive_f = false;
     for (int i = 0; i < Q; ++i) {
         // f_post = f_pre + alpha * beta * (f_eq - f_pre)
-        // Note: beta = dt/(2*tau+dt). If dt=1, beta = 1/(2*tau+1)
-        // The paper uses alpha*beta in Eq 53, but the condition H(f + alpha*(feq-f)) = H(f) in Eq 54.
-        // Let's follow Eq 54 directly, assuming the collision step is f* = f + alpha * (feq - f)
-        // where alpha is related to the relaxation time AND the entropy constraint.
         // Let's redefine the collision as: f_post = f_pre + relaxation_param * (f_eq - f_pre)
-        // where relaxation_param = alpha * beta. We solve for alpha using H constraint.
-        // f_post[i] = f_pre[i] + alpha * beta * (f_eq[i] - f_pre[i]); // Original interpretation
-        f_post[i] = f_pre[i] + alpha * (f_eq[i] - f_pre[i]); // Interpretation following Eq 54 structure more directly
+        // where relaxation_param = alpha * beta. We solve for alpha using H constraint and apply it.
+        f_post[i] = f_pre[i] + alpha * beta * (f_eq[i] - f_pre[i]); // Use alpha*beta for trial state
 
         if (f_post[i] <= 0.0) {
             non_positive_f = true;
@@ -61,16 +56,26 @@ Real EntropicCollision::AlphaObjective::operator()(Real alpha) const {
 Real EntropicCollision::collide(NodeData& node, const Lattice& lattice, Real beta, Real alpha_tol, int alpha_max_iter) {
     if (!node.is_fluid) return 1.0; // No collision for non-fluid
 
+    // --- Pre-Collision Positivity Clamp (Defensive) ---
+    // Ensure f is positive before calculating H_pre, as non-positivity might come from streaming/BCs
+    for (int i = 0; i < lattice.get_Q(); ++i) {
+        if (node.f[i] <= 0.0) {
+            // Uncomment the warning if you want to know when this pre-clamp is triggered
+            // std::cerr << "Warning: Clamping non-positive f[" << i << "] = " << node.f[i] << " BEFORE H_pre calculation." << std::endl;
+            node.f[i] = REAL_EPSILON;
+        }
+    }
+    // --- End Pre-Collision Clamp ---
+
     // 1. Compute Entropic Equilibrium f_eq (should be done before calling collide)
     //    Assuming node.f_eq is already computed and valid.
 
     // 2. Define the objective function G(alpha) = H(f_post) - H(f_pre)
-    AlphaObjective objective(node.f, node.f_eq, lattice, beta);
+    AlphaObjective objective(node.f, node.f_eq, lattice, beta); // Now node.f is guaranteed positive
 
-    // Check if initial H calculation failed
+    // Check if initial H calculation failed (Could still fail if f_eq is bad, but less likely)
     if (objective.H_pre >= REAL_MAX) {
-         std::cerr << "Error: Cannot perform entropic collision due to invalid initial H." << std::endl;
-         // Don't modify f, return alpha=1?
+         std::cerr << "Error: Cannot perform entropic collision - H_pre calculation failed even after clamping f_pre." << std::endl;
          return 1.0;
     }
 
@@ -78,7 +83,7 @@ Real EntropicCollision::collide(NodeData& node, const Lattice& lattice, Real bet
     //    Search range [1.0, alpha_max]. alpha_max=2 corresponds to standard LBGK limit.
     //    We need a slightly larger range to allow for the entropic adjustment.
     Real alpha_min_search = 1.0;
-    Real alpha_max_search = 2.1; // Allow slightly > 2
+    Real alpha_max_search = 2.0; // Reduce search range slightly from 2.1 to 2.0
 
     // Evaluate function at bounds to ensure a root might exist (sign change)
     Real G_at_min = objective(alpha_min_search);
@@ -129,11 +134,11 @@ Real EntropicCollision::collide(NodeData& node, const Lattice& lattice, Real bet
     Real alpha_eff = alpha * beta;
     for (int i = 0; i < lattice.get_Q(); ++i) {
         node.f[i] = node.f[i] + alpha_eff * (node.f_eq[i] - node.f[i]);
-        // Ensure positivity after collision (should be guaranteed by alpha solver, but double check)
-        if (node.f[i] < 0.0) {
-             // This indicates a potential problem with the alpha calculation or f_eq
-             // std::cerr << "Warning: Negative f[" << i << "] = " << node.f[i] << " after collision with alpha=" << alpha << ", beta=" << beta << ". Clamping." << std::endl;
-             node.f[i] = REAL_EPSILON;
+        // Ensure positivity after collision (redundant if pre-clamp exists AND alpha solver works, but keep for safety)
+        if (node.f[i] <= 0.0) { // Use <= 0.0 for safety
+             // Uncomment the warning if desired for debugging, but clamp regardless
+             // std::cerr << "Warning: Non-positive f[" << i << "] = " << node.f[i] << " after collision with alpha=" << alpha << ", beta=" << beta << ". Clamping." << std::endl;
+             node.f[i] = REAL_EPSILON; // Clamp to small positive value
         }
     }
 

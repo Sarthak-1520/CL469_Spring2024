@@ -3,37 +3,31 @@
 #include <cmath> // For isnan/isinf
 #include <iostream>
 
-void BoundaryConditions::apply_all(std::vector<std::vector<NodeData>>& grid, const Lattice& lattice, Real lid_velocity) {
+void BoundaryConditions::apply_all(std::vector<std::vector<NodeData>>& grid, const Lattice& lattice, Real inlet_velocity) {
     int nx = grid.size();
     int ny = grid[0].size();
     const auto& c = lattice.get_c();
+    const auto& w = lattice.get_w(); // Need weights for inlet BC
     int Q = lattice.get_Q();
+    Real cs2 = lattice.get_cs2();
 
-    // --- Apply Bounce-Back on Walls ---
+    // --- Apply Bounce-Back on ALL Walls (Top/Bottom/Ellipse) ---
     // Iterate through all nodes. If a node is !is_fluid, apply bounce back
-    // This requires knowing which populations point *into* the fluid from the wall.
-    // A simpler approach often used is to do bounce-back *during* streaming:
-    // If f[opp[k]] streams from a fluid node (i,j) to a wall node (iw, jw),
-    // then set f[k] at (i,j) for the *next* step to the value f[opp[k]] had *before* streaming.
-    // However, the current structure applies BC *after* streaming.
-
-    // Let's stick to post-streaming bounce-back for now.
-    // For each wall node, look at its fluid neighbors.
+    // to the populations in the neighboring fluid nodes that just streamed into the wall.
     for (int i = 0; i < nx; ++i) {
         for (int j = 0; j < ny; ++j) {
             if (!grid[i][j].is_fluid) {
-                // This is a wall node. Find fluid neighbors and apply bounce-back.
-                // The populations f_new[k] at the wall node came from fluid neighbors f[k] at (i-cx, j-cy).
-                // We need to reflect these back.
+                // This is a wall node (ellipse or top/bottom).
+                // Populations f_new[k] at this wall node came from fluid neighbors f[k] at (i-cx, j-cy).
+                // Reflect these back to the fluid neighbors.
                 for (int k = 0; k < Q; ++k) {
                     int prev_i = i - static_cast<int>(c[k].x);
                     int prev_j = j - static_cast<int>(c[k].y);
 
                     // Check if the source node was within bounds and was fluid
                     if (prev_i >= 0 && prev_i < nx && prev_j >= 0 && prev_j < ny && grid[prev_i][prev_j].is_fluid) {
-                        // The population f_new[k] at wall (i,j) came from fluid (prev_i, prev_j).
                         // Bounce it back: The population f[opp[k]] at the fluid node (prev_i, prev_j)
-                        // should receive the value that just arrived at the wall.
+                        // should receive the value f_new[k] that just streamed *to* the wall node (i,j).
                         grid[prev_i][prev_j].f[lattice.opposite(k)] = grid[i][j].f_new[k];
                     }
                 }
@@ -42,69 +36,77 @@ void BoundaryConditions::apply_all(std::vector<std::vector<NodeData>>& grid, con
     }
 
 
-    // --- Apply Lid Velocity (Top Wall, excluding corners) ---
-    Vector2D lid_u = {lid_velocity, 0.0};
-    int j_top = ny - 1;
-    for (int i = 1; i < nx - 1; ++i) {
-        if (!grid[i][j_top].is_fluid) { // Should be wall nodes
-             // We need to reconstruct the unknown populations pointing into the fluid
-             // using the known velocity. Use Zou-He style non-equilibrium bounce-back.
-             Real rho_neighbor = grid[i][j_top-1].rho; // Use rho from adjacent fluid node
+    // --- Apply Inlet Condition (Left Wall, i=0) --- Fixed Velocity (Zou-He style)
+    Vector2D inlet_u = {inlet_velocity, 0.0};
+    Real inlet_rho = 1.0;
+    for (int j = 1; j < ny - 1; ++j) { // Exclude corners (already bounce-back)
+        if (grid[0][j].is_fluid) { // Check if it's a fluid node (it should be)
+            // Unknown populations: f1, f5, f8 (pointing rightwards)
+            // Known populations (streamed from i=1): f3, f6, f7
+            // Known populations (streamed from i=0): f0, f2, f4 (these are updated by collision/streaming before BC)
 
-             // Calculate missing populations (2, 6, 7 for top wall)
-             // f_opp = f_k + correction
-             // Correction term based on density and target velocity difference from bounce-back
-             Real w2 = lattice.get_w()[2]; Real w6 = lattice.get_w()[6];
-             Real w5 = lattice.get_w()[5]; // Define w5
-             Real cs2 = lattice.get_cs2();
+            // Use Zou-He method to find f1, f5, f8 based on inlet_rho and inlet_u
+            // First, calculate rho based on known populations (assuming f1,f5,f8 are equilibrium for rho=1,u=0 initially? No, use target rho)
+            // rho = f0 + f2 + f4 + 2*(f3 + f6 + f7) ?? No, that's for BB
 
-             // Populations streaming *from* the wall node (i, j_top) after bounce-back would be:
-             // f_4_bb = grid[i][j_top].f_new[2]; // f_new[k] holds value streamed *to* wall node
-             // f_8_bb = grid[i][j_top].f_new[6];
-             // f_5_bb = grid[i][j_top].f_new[7];
+            // Classic Zou-He for left wall inlet (velocity specified):
+            Real f0 = grid[0][j].f[0]; // Use post-streamed values for known directions
+            Real f2 = grid[0][j].f[2];
+            Real f4 = grid[0][j].f[4];
+            Real f3 = grid[0][j].f[3];
+            Real f6 = grid[0][j].f[6];
+            Real f7 = grid[0][j].f[7];
 
-             // Apply Zou-He correction based on target velocity (lid_u) and neighbor density
-             // f_i = f_eq(rho_neighbor, lid_u)_i + (f_i_bb - f_eq(rho_neighbor, 0)_i) ??? No, simpler form:
-             // Calculate rho at wall based on known populations + guess for unknowns assuming u=0
-             // Then calculate unknowns to match target u.
+            // Calculate rho first (this differs slightly between Zou-He variants)
+            // A common way: Assume rho = sum(f_known) / (1 - ux)
+            // Let's use the target rho directly (inlet_rho = 1.0)
+            Real rho = inlet_rho; 
 
-             // Simpler non-equilibrium bounce back:
-             // f_i = f_opp_streamed_in + 2 * w_i * rho_neighbor * (c_i . u_wall) / cs^2
-             grid[i][j_top-1].f[2] = grid[i][j_top].f_new[4] + 2.0 * w2 * rho_neighbor * dot(c[2], lid_u) / cs2;
-             grid[i][j_top-1].f[5] = grid[i][j_top].f_new[7] + 2.0 * w5 * rho_neighbor * dot(c[5], lid_u) / cs2;
-             grid[i][j_top-1].f[6] = grid[i][j_top].f_new[8] + 2.0 * w6 * rho_neighbor * dot(c[6], lid_u) / cs2;
+            // Calculate unknown populations f1, f5, f8 to match rho and u_in
+            Real ux = inlet_u.x;
+            Real uy = inlet_u.y; // Should be 0
 
-             // Ensure positivity (crude clamp)
-             if(grid[i][j_top-1].f[2] < 0) grid[i][j_top-1].f[2] = REAL_EPSILON;
-             if(grid[i][j_top-1].f[5] < 0) grid[i][j_top-1].f[5] = REAL_EPSILON;
-             if(grid[i][j_top-1].f[6] < 0) grid[i][j_top-1].f[6] = REAL_EPSILON;
+            grid[0][j].f[1] = f3 + (2.0/3.0) * rho * ux;
+            grid[0][j].f[5] = f7 + 0.5 * (rho * ux + rho * uy) + (1.0/6.0) * rho * ux - 0.5 * (f2 - f4);
+            grid[0][j].f[8] = f6 + 0.5 * (rho * ux - rho * uy) + (1.0/6.0) * rho * ux + 0.5 * (f2 - f4);
+
+            // Simple positivity clamp (crude, may indicate instability if needed often)
+            if(grid[0][j].f[1]<0) grid[0][j].f[1] = REAL_EPSILON;
+            if(grid[0][j].f[5]<0) grid[0][j].f[5] = REAL_EPSILON;
+            if(grid[0][j].f[8]<0) grid[0][j].f[8] = REAL_EPSILON;
         }
+    }
+
+    // --- Apply Outlet Condition (Right Wall, i=nx-1) --- Simple Extrapolation
+    for (int j = 1; j < ny - 1; ++j) { // Exclude corners
+         if (grid[nx-1][j].is_fluid) { // Check if it's a fluid node (it should be)
+             // Extrapolate populations pointing OUT of domain (leftwards: 3, 6, 7)
+             // from the previous node (nx-2)
+             grid[nx - 1][j].f[3] = grid[nx - 2][j].f[3];
+             grid[nx - 1][j].f[6] = grid[nx - 2][j].f[6];
+             grid[nx - 1][j].f[7] = grid[nx - 2][j].f[7];
+
+            // Optionally: recalculate rho/u at outlet based on all populations?
+            // For simple extrapolation, often just applying it to the distributions is done.
+         }
     }
 }
 
 
-// --- Individual BC functions (Example - might not be used directly by apply_all above) ---
+// --- Individual BC functions (Keep for reference, but apply_all handles logic) ---
 
 void BoundaryConditions::bounce_back(NodeData& wall_node, const Lattice& lattice, const std::vector<NodeData*>& fluid_neighbors) {
-    // This function is harder to use correctly in the post-streaming application style.
-    // The logic is better integrated into apply_all or done during streaming.
-    // For completeness, if called *before* streaming on a wall node:
-    // for (int k = 0; k < lattice.get_Q(); ++k) {
-    //     wall_node.f_new[lattice.opposite(k)] = wall_node.f[k];
-    // }
+    // Logic moved into apply_all for post-streaming bounce-back
     (void)wall_node; // Avoid unused parameter warning
     (void)lattice;
     (void)fluid_neighbors;
 }
 
 void BoundaryConditions::fixed_velocity(NodeData& boundary_node, const Lattice& lattice, const Vector2D& target_u, Real target_rho) {
-     // Zou-He method (simplified example for a specific boundary orientation)
-     // Assumes boundary_node is adjacent to the fluid domain.
-     // Needs information about which populations are unknown (coming from outside).
-     // This is complex to generalize here. The implementation in apply_all is specific to the lid.
+     // Logic implemented specifically for inlet in apply_all
      (void)boundary_node; // Avoid unused parameter warning
      (void)lattice;
      (void)target_u;
      (void)target_rho;
-     std::cerr << "Warning: BoundaryConditions::fixed_velocity is not fully implemented." << std::endl;
+     // std::cerr << "Warning: BoundaryConditions::fixed_velocity is not fully implemented as generic function." << std::endl;
 }

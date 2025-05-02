@@ -6,8 +6,8 @@
 #include "entropic_equilibrium.h"
 #include "data_writer.h" // Changed from vtk_writer.h
 
-Simulator::Simulator(int nx_in, int ny_in, Real viscosity_in, Real lid_velocity_in, int total_steps_in, int output_freq_in)
-    : nx(nx_in), ny(ny_in), viscosity(viscosity_in), lid_velocity(lid_velocity_in),
+Simulator::Simulator(int nx_in, int ny_in, Real viscosity_in, Real inlet_velocity_in, int total_steps_in, int output_freq_in)
+    : nx(nx_in), ny(ny_in), viscosity(viscosity_in), inlet_velocity(inlet_velocity_in),
       total_steps(total_steps_in), output_freq(output_freq_in),
       lattice(), // Initialize D2Q9 lattice
       grid(nx, std::vector<NodeData>(ny, NodeData(lattice.get_Q())))
@@ -21,7 +21,7 @@ Simulator::Simulator(int nx_in, int ny_in, Real viscosity_in, Real lid_velocity_
     std::cout << "--- Simulation Parameters ---" << std::endl;
     std::cout << "Grid size: " << nx << " x " << ny << std::endl;
     std::cout << "Viscosity: " << viscosity << std::endl;
-    std::cout << "Lid Velocity: " << lid_velocity << std::endl;
+    std::cout << "Inlet Velocity: " << inlet_velocity << std::endl;
     std::cout << "Tau: " << tau << std::endl;
     std::cout << "Beta: " << beta << std::endl;
     std::cout << "Total steps: " << total_steps << std::endl;
@@ -38,43 +38,65 @@ Simulator::Simulator(int nx_in, int ny_in, Real viscosity_in, Real lid_velocity_
 }
 
 void Simulator::initialize_grid() {
-    std::cout << "Initializing grid..." << std::endl;
+    std::cout << "Initializing grid for flow around ellipse..." << std::endl;
+    // Uniform inlet flow profile
     Real initial_rho = 1.0;
-    Vector2D initial_u = {0.0, 0.0};
+    Vector2D initial_u = {inlet_velocity, 0.0};
 
+    // Define ellipse parameters (ideally passed from main or constructor)
+    // Re-define them here for now, mirroring main.cpp - this is not ideal design
+    Real ellipse_cx = nx / 4.0;
+    Real ellipse_cy = ny / 2.0;
+    Real ellipse_a = ny / 8.0;
+    Real ellipse_b = ny / 8.0;
+
+    // Setup boundaries *before* initializing distributions
+    setup_boundaries(ellipse_cx, ellipse_cy, ellipse_a, ellipse_b);
+
+    // Initialize all nodes (including boundary nodes initially)
     for (int i = 0; i < nx; ++i) {
         for (int j = 0; j < ny; ++j) {
             grid[i][j].rho = initial_rho;
             grid[i][j].u = initial_u;
-            grid[i][j].u_old = initial_u;
-            grid[i][j].initialize_equilibrium(lattice); // Sets f = f_eq
+            // If node was marked as wall by setup_boundaries, reset velocity
+            if (!grid[i][j].is_fluid) {
+                grid[i][j].u = {0.0, 0.0};
+            }
+            grid[i][j].u_old = grid[i][j].u; // Initialize u_old
+            grid[i][j].initialize_equilibrium(lattice); // Sets f = f_eq based on local rho, u
         }
     }
-    setup_boundaries();
+
     std::cout << "Grid initialized." << std::endl;
 }
 
-void Simulator::setup_boundaries() {
-    // Mark wall nodes (all outer boundaries except top lid)
+void Simulator::setup_boundaries(Real ellipse_cx, Real ellipse_cy, Real ellipse_a, Real ellipse_b) {
+    std::cout << "Setting up ellipse and wall boundaries..." << std::endl;
+    // Mark nodes inside the ellipse as non-fluid
     for (int i = 0; i < nx; ++i) {
-        grid[i][0].is_fluid = false;      // Bottom wall
-        if (i > 0 && i < nx - 1) {        // Exclude corners for lid velocity BC
-             grid[i][ny - 1].is_fluid = false; // Top wall (lid)
-        } else {
-             grid[i][ny - 1].is_fluid = false; // Top corners are walls
+        for (int j = 0; j < ny; ++j) {
+            Real term1 = ((static_cast<Real>(i) - ellipse_cx) / ellipse_a);
+            Real term2 = ((static_cast<Real>(j) - ellipse_cy) / ellipse_b);
+            if ((term1 * term1 + term2 * term2) <= 1.0) {
+                grid[i][j].is_fluid = false;
+            }
         }
     }
-    for (int j = 1; j < ny - 1; ++j) { // Exclude already set corners
-        grid[0][j].is_fluid = false;      // Left wall
-        grid[nx - 1][j].is_fluid = false; // Right wall
-    }
-     // Ensure corners are marked as non-fluid
-     grid[0][0].is_fluid = false;
-     grid[nx-1][0].is_fluid = false;
-     grid[0][ny-1].is_fluid = false;
-     grid[nx-1][ny-1].is_fluid = false;
-}
 
+    // Mark top and bottom walls as non-fluid
+    for (int i = 0; i < nx; ++i) {
+        grid[i][0].is_fluid = false;      // Bottom wall
+        grid[i][ny - 1].is_fluid = false; // Top wall
+    }
+
+    // Inlet (i=0) and Outlet (i=nx-1) remain fluid for now; handled by apply_all
+    // Ensure corners are marked correctly based on wall logic
+    grid[0][0].is_fluid = false;
+    grid[nx-1][0].is_fluid = false;
+    grid[0][ny-1].is_fluid = false;
+    grid[nx-1][ny-1].is_fluid = false;
+    std::cout << "Boundaries set." << std::endl;
+}
 
 void Simulator::run() {
     initialize_grid();
@@ -168,15 +190,24 @@ void Simulator::streaming_step() {
 
 void Simulator::apply_boundary_conditions_step() {
      // Copy f_new to f for wall nodes first, as streaming doesn't update them
+     // This might be needed BEFORE specific BCs if they read f[k]
+     // However, standard Zou-He and bounce-back read f_new[k] (post-stream)
+     // Let's keep the apply_all call first
+
+     // Apply specific BC logic (bounce-back, inlet, outlet)
+     BoundaryConditions::apply_all(grid, lattice, inlet_velocity); // Pass inlet_velocity
+
+    // It might be necessary to re-copy f_new to f for wall nodes *after* BCs
+    // if the BCs modify f directly instead of f_new for reflection.
+    // The current bounce-back modifies f of the *neighboring* fluid node.
+    // Inlet/Outlet modify f of the boundary node.
      for (int i = 0; i < nx; ++i) {
          for (int j = 0; j < ny; ++j) {
              if (!grid[i][j].is_fluid) {
-                 grid[i][j].f = grid[i][j].f_new;
+                 grid[i][j].f = grid[i][j].f_new; // Ensure wall nodes have post-stream state for next step's collision (if it were calculated)
              }
          }
      }
-     // Now apply specific BC logic (bounce-back, lid velocity)
-     BoundaryConditions::apply_all(grid, lattice, lid_velocity);
 }
 
 
