@@ -3,30 +3,112 @@
 #include <vector>
 #include <cmath> // For std::sqrt, std::abs
 #include <iomanip> // For std::setprecision
+#include <filesystem> // For creating directories
 #include "entropic_equilibrium.h"
 #include "data_writer.h" // Changed from vtk_writer.h
 
-Simulator::Simulator(int nx_in, int ny_in, Real viscosity_in, Real inlet_velocity_in, int total_steps_in, int output_freq_in)
-    : nx(nx_in), ny(ny_in), viscosity(viscosity_in), inlet_velocity(inlet_velocity_in),
-      total_steps(total_steps_in), output_freq(output_freq_in),
+std::string Simulator::get_case_name() const {
+    switch (geometry_type) {
+        case GeometryType::ELLIPSE:
+            return "ellipse_flow";
+        case GeometryType::LID_DRIVEN_CAVITY:
+            return "lid_driven_cavity";
+        case GeometryType::CHANNEL_OBSTACLE:
+            return "channel_obstacle";
+        case GeometryType::BACKWARD_FACING_STEP:
+            return "backward_facing_step";
+        case GeometryType::TAYLOR_GREEN_VORTEX:
+            return "taylor_green_vortex";
+        case GeometryType::POISEUILLE_FLOW:
+            return "poiseuille_flow";
+        default:
+            return "unknown";
+    }
+}
+
+std::string Simulator::get_collision_model_name() const {
+    return (collision_model == CollisionModel::ENTROPIC) ? "entropic" : "trt";
+}
+
+Simulator::Simulator(int nx_in, int ny_in, Real viscosity_in, Real characteristic_velocity_in,
+                     int total_steps_in, int output_freq_in, CollisionModel model, Real magic_param_in,
+                     GeometryType geometry_type_in, Real param1, Real param2, Real param3, Real param4)
+    : nx(nx_in), ny(ny_in), viscosity(viscosity_in), characteristic_velocity(characteristic_velocity_in),
+      total_steps(total_steps_in), output_freq(output_freq_in), collision_model(model),
+      magic_param(magic_param_in), geometry_type(geometry_type_in),
+      geom_param1(param1), geom_param2(param2), geom_param3(param3), geom_param4(param4),
       lattice(), // Initialize D2Q9 lattice
       grid(nx, std::vector<NodeData>(ny, NodeData(lattice.get_Q())))
 {
     // Calculate relaxation time tau from viscosity
     // viscosity = cs^2 * (tau - 0.5*dt). Assuming dt=1.
-    // tau = viscosity / cs^2 + 0.5
+    // tau = viscosity / lattice.get_cs2() + 0.5
     tau = viscosity / lattice.get_cs2() + 0.5;
     beta = 1.0 / (2.0 * tau + 1.0); // dt=1 assumed
 
+    // For TRT model, calculate tau_minus based on the magic parameter
+    if (collision_model == CollisionModel::TRT) {
+        tau_minus = TRTCollision::compute_tau_minus(tau, magic_param);
+    }
+
+    // Print geometry type
+    std::string geometry_name;
+    switch (geometry_type) {
+        case GeometryType::ELLIPSE:
+            geometry_name = "Flow around elliptical obstacle";
+            break;
+        case GeometryType::LID_DRIVEN_CAVITY:
+            geometry_name = "Lid-driven cavity flow";
+            break;
+        case GeometryType::CHANNEL_OBSTACLE:
+            geometry_name = "Channel flow with circular obstacle";
+            break;
+        case GeometryType::BACKWARD_FACING_STEP:
+            geometry_name = "Backward-facing step flow";
+            break;
+        case GeometryType::TAYLOR_GREEN_VORTEX:
+            geometry_name = "Taylor-Green vortex decay";
+            break;
+        case GeometryType::POISEUILLE_FLOW:
+            geometry_name = "Poiseuille flow in a channel";
+            break;
+        default:
+            geometry_name = "Unknown geometry";
+    }
+
     std::cout << "--- Simulation Parameters ---" << std::endl;
+    std::cout << "Geometry: " << geometry_name << std::endl;
     std::cout << "Grid size: " << nx << " x " << ny << std::endl;
     std::cout << "Viscosity: " << viscosity << std::endl;
-    std::cout << "Inlet Velocity: " << inlet_velocity << std::endl;
+    std::cout << "Characteristic velocity: " << characteristic_velocity << std::endl;
     std::cout << "Tau: " << tau << std::endl;
-    std::cout << "Beta: " << beta << std::endl;
+    std::cout << "Collision model: " << (collision_model == CollisionModel::ENTROPIC ? "Entropic" : "TRT") << std::endl;
+
+    if (collision_model == CollisionModel::ENTROPIC) {
+        std::cout << "Beta: " << beta << std::endl;
+    } else {
+        std::cout << "Magic parameter: " << magic_param << std::endl;
+        std::cout << "Tau minus: " << tau_minus << std::endl;
+    }
+
     std::cout << "Total steps: " << total_steps << std::endl;
     std::cout << "Output frequency: " << output_freq << std::endl;
     std::cout << "---------------------------" << std::endl;
+
+    // Set up output directory and file paths
+    std::string case_name = get_case_name();
+    std::string model_name = get_collision_model_name();
+    std::string case_dir = "results/" + case_name + "_" + model_name;
+
+    // Create output directory if it doesn't exist
+    std::filesystem::create_directories(case_dir);
+
+    // Set output directory and convergence file path
+    output_dir = case_dir;
+    convergence_file = case_dir + "/convergence.dat";
+
+    std::cout << "Output directory: " << output_dir << std::endl;
+    std::cout << "Convergence file: " << convergence_file << std::endl;
 
     // Open convergence file
     convergence_out.open(convergence_file);
@@ -38,30 +120,68 @@ Simulator::Simulator(int nx_in, int ny_in, Real viscosity_in, Real inlet_velocit
 }
 
 void Simulator::initialize_grid() {
-    std::cout << "Initializing grid for flow around ellipse..." << std::endl;
-    // Uniform inlet flow profile
+    std::cout << "Initializing grid..." << std::endl;
+
+    // Set all nodes as fluid initially
+    for (int i = 0; i < nx; ++i) {
+        for (int j = 0; j < ny; ++j) {
+            grid[i][j].is_fluid = true;
+        }
+    }
+
+    // Setup boundaries based on geometry type
+    setup_boundaries();
+
+    // Initialize all nodes with appropriate initial conditions
     Real initial_rho = 1.0;
-    Vector2D initial_u = {inlet_velocity, 0.0};
+    Vector2D initial_u = {0.0, 0.0}; // Default initial velocity
 
-    // Define ellipse parameters (ideally passed from main or constructor)
-    // Re-define them here for now, mirroring main.cpp - this is not ideal design
-    Real ellipse_cx = nx / 4.0;
-    Real ellipse_cy = ny / 2.0;
-    Real ellipse_a = ny / 8.0;
-    Real ellipse_b = ny / 8.0;
+    // Set initial conditions based on geometry type
+    switch (geometry_type) {
+        case GeometryType::ELLIPSE:
+        case GeometryType::CHANNEL_OBSTACLE:
+        case GeometryType::BACKWARD_FACING_STEP:
+            // Uniform inlet flow profile
+            initial_u = {characteristic_velocity, 0.0};
+            break;
 
-    // Setup boundaries *before* initializing distributions
-    setup_boundaries(ellipse_cx, ellipse_cy, ellipse_a, ellipse_b);
+        case GeometryType::LID_DRIVEN_CAVITY:
+            // Zero initial velocity inside cavity
+            initial_u = {0.0, 0.0};
+            break;
 
-    // Initialize all nodes (including boundary nodes initially)
+        case GeometryType::TAYLOR_GREEN_VORTEX:
+            // Taylor-Green vortex has a specific initial condition
+            // Will be set in the loop below
+            break;
+
+        case GeometryType::POISEUILLE_FLOW:
+            // Zero initial velocity for Poiseuille flow
+            initial_u = {0.0, 0.0};
+            break;
+    }
+
+    // Initialize all nodes (including boundary nodes)
     for (int i = 0; i < nx; ++i) {
         for (int j = 0; j < ny; ++j) {
             grid[i][j].rho = initial_rho;
-            grid[i][j].u = initial_u;
+
+            // Special case for Taylor-Green vortex
+            if (geometry_type == GeometryType::TAYLOR_GREEN_VORTEX) {
+                // Taylor-Green vortex initial condition
+                Real x = static_cast<Real>(i) / nx;
+                Real y = static_cast<Real>(j) / ny;
+                grid[i][j].u.x = characteristic_velocity * std::sin(2.0 * M_PI * x) * std::cos(2.0 * M_PI * y);
+                grid[i][j].u.y = -characteristic_velocity * std::cos(2.0 * M_PI * x) * std::sin(2.0 * M_PI * y);
+            } else {
+                grid[i][j].u = initial_u;
+            }
+
             // If node was marked as wall by setup_boundaries, reset velocity
             if (!grid[i][j].is_fluid) {
                 grid[i][j].u = {0.0, 0.0};
             }
+
             grid[i][j].u_old = grid[i][j].u; // Initialize u_old
             grid[i][j].initialize_equilibrium(lattice); // Sets f = f_eq based on local rho, u
         }
@@ -70,31 +190,40 @@ void Simulator::initialize_grid() {
     std::cout << "Grid initialized." << std::endl;
 }
 
-void Simulator::setup_boundaries(Real ellipse_cx, Real ellipse_cy, Real ellipse_a, Real ellipse_b) {
-    std::cout << "Setting up ellipse and wall boundaries..." << std::endl;
-    // Mark nodes inside the ellipse as non-fluid
-    for (int i = 0; i < nx; ++i) {
-        for (int j = 0; j < ny; ++j) {
-            Real term1 = ((static_cast<Real>(i) - ellipse_cx) / ellipse_a);
-            Real term2 = ((static_cast<Real>(j) - ellipse_cy) / ellipse_b);
-            if ((term1 * term1 + term2 * term2) <= 1.0) {
-                grid[i][j].is_fluid = false;
-            }
-        }
+void Simulator::setup_boundaries() {
+    std::cout << "Setting up boundaries for " <<
+        (geometry_type == GeometryType::ELLIPSE ? "elliptical flow" :
+         geometry_type == GeometryType::LID_DRIVEN_CAVITY ? "lid-driven cavity" :
+         geometry_type == GeometryType::CHANNEL_OBSTACLE ? "channel with obstacle" :
+         geometry_type == GeometryType::BACKWARD_FACING_STEP ? "backward-facing step" :
+         geometry_type == GeometryType::TAYLOR_GREEN_VORTEX ? "Taylor-Green vortex" :
+         geometry_type == GeometryType::POISEUILLE_FLOW ? "Poiseuille flow" : "unknown geometry")
+        << "..." << std::endl;
+
+    // Call the appropriate setup method based on geometry type
+    switch (geometry_type) {
+        case GeometryType::ELLIPSE:
+            setup_ellipse_flow();
+            break;
+        case GeometryType::LID_DRIVEN_CAVITY:
+            setup_lid_driven_cavity();
+            break;
+        case GeometryType::CHANNEL_OBSTACLE:
+            setup_channel_obstacle();
+            break;
+        case GeometryType::BACKWARD_FACING_STEP:
+            setup_backward_facing_step();
+            break;
+        case GeometryType::TAYLOR_GREEN_VORTEX:
+            setup_taylor_green_vortex();
+            break;
+        case GeometryType::POISEUILLE_FLOW:
+            setup_poiseuille_flow();
+            break;
+        default:
+            std::cerr << "Error: Unknown geometry type!" << std::endl;
     }
 
-    // Mark top and bottom walls as non-fluid
-    for (int i = 0; i < nx; ++i) {
-        grid[i][0].is_fluid = false;      // Bottom wall
-        grid[i][ny - 1].is_fluid = false; // Top wall
-    }
-
-    // Inlet (i=0) and Outlet (i=nx-1) remain fluid for now; handled by apply_all
-    // Ensure corners are marked correctly based on wall logic
-    grid[0][0].is_fluid = false;
-    grid[nx-1][0].is_fluid = false;
-    grid[0][ny-1].is_fluid = false;
-    grid[nx-1][ny-1].is_fluid = false;
     std::cout << "Boundaries set." << std::endl;
 }
 
@@ -122,21 +251,34 @@ void Simulator::time_step(int t) {
     streaming_step();
     apply_boundary_conditions_step(); // Apply BCs *after* streaming
     update_macroscopics_and_convergence(); // Calculate rho, u and check convergence
+
+    // Write convergence data at each time step
+    if (convergence_out.is_open()) {
+        convergence_out << t << " "
+                       << std::scientific << std::setprecision(10)
+                       << current_max_delta_u << std::endl;
+    }
 }
 
 void Simulator::collision_step() {
-    #pragma omp parallel for collapse(2) // Optional: Parallelize collision
+    // Removed OpenMP pragma for compatibility
     for (int i = 0; i < nx; ++i) {
         for (int j = 0; j < ny; ++j) {
             if (grid[i][j].is_fluid) {
-                // 1. Compute entropic equilibrium f_eq
+                // 1. Compute equilibrium distribution
                 if (!EntropicEquilibrium::compute(grid[i][j], lattice)) {
                     // Handle failure - maybe revert to polynomial or stop?
                     // For now, it prints a warning inside compute()
-                    // We might need a fallback here if compute returns false
                 }
-                // 2. Perform entropic collision
-                EntropicCollision::collide(grid[i][j], lattice, beta);
+
+                // 2. Perform collision based on selected model
+                if (collision_model == CollisionModel::ENTROPIC) {
+                    // Entropic collision with variable relaxation parameter
+                    EntropicCollision::collide(grid[i][j], lattice, beta);
+                } else {
+                    // Two-Relaxation-Time collision
+                    TRTCollision::collide(grid[i][j], lattice, tau, tau_minus);
+                }
             }
         }
     }
@@ -146,7 +288,7 @@ void Simulator::streaming_step() {
     const auto& c = lattice.get_c();
     int Q = lattice.get_Q();
 
-    #pragma omp parallel for collapse(2) // Optional: Parallelize streaming prep
+    // Removed OpenMP pragma for compatibility
     for (int i = 0; i < nx; ++i) {
         for (int j = 0; j < ny; ++j) {
              // Prepare f_new based on post-collision f
@@ -156,7 +298,7 @@ void Simulator::streaming_step() {
     }
 
 
-    #pragma omp parallel for collapse(2) // Optional: Parallelize streaming update
+    // Removed OpenMP pragma for compatibility
     for (int i = 0; i < nx; ++i) {
         for (int j = 0; j < ny; ++j) {
             // Pull scheme: Update f[i][j] from neighbors' f_new
@@ -195,7 +337,7 @@ void Simulator::apply_boundary_conditions_step() {
      // Let's keep the apply_all call first
 
      // Apply specific BC logic (bounce-back, inlet, outlet)
-     BoundaryConditions::apply_all(grid, lattice, inlet_velocity); // Pass inlet_velocity
+     BoundaryConditions::apply_all(grid, lattice, characteristic_velocity, geometry_type);
 
     // It might be necessary to re-copy f_new to f for wall nodes *after* BCs
     // if the BCs modify f directly instead of f_new for reflection.
@@ -214,58 +356,43 @@ void Simulator::apply_boundary_conditions_step() {
 void Simulator::update_macroscopics_and_convergence() {
     Real max_delta_u_sq = 0.0;
 
-    #pragma omp parallel for collapse(2) reduction(max:max_delta_u_sq)
+    // Removed OpenMP pragma for compatibility
     for (int i = 0; i < nx; ++i) {
         for (int j = 0; j < ny; ++j) {
             if (grid[i][j].is_fluid) {
-                grid[i][j].u_old = grid[i][j].u; // Store previous velocity
-                grid[i][j].compute_macroscopics(lattice); // Calculate new rho, u from post-BC f
+                // Store previous velocity before updating
+                grid[i][j].u_old = grid[i][j].u;
+
+                // Calculate new rho, u from post-BC f
+                grid[i][j].compute_macroscopics(lattice);
 
                 // Calculate change in velocity magnitude squared
                 Real dux = grid[i][j].u.x - grid[i][j].u_old.x;
                 Real duy = grid[i][j].u.y - grid[i][j].u_old.y;
                 Real delta_u_sq = dux * dux + duy * duy;
+
+                // Update maximum delta_u
                 if (delta_u_sq > max_delta_u_sq) {
                     max_delta_u_sq = delta_u_sq;
                 }
             } else {
-                 // Reset wall node macroscopics (optional, compute_macroscopics handles it)
-                 grid[i][j].rho = 0.0;
-                 grid[i][j].u = {0.0, 0.0};
-                 grid[i][j].u_old = {0.0, 0.0};
+                // Reset wall node macroscopics
+                grid[i][j].rho = 0.0;
+                grid[i][j].u = {0.0, 0.0};
+                grid[i][j].u_old = {0.0, 0.0};
             }
         }
     }
 
-    Real max_delta_u = std::sqrt(max_delta_u_sq);
-    if (convergence_out.is_open()) {
-         // Get current step number (needs to be passed or stored)
-         // Assuming we call this once per step, need step counter 't'
-         // Let's assume 't' is available or passed. For now, placeholder:
-         // convergence_out << t << " " << std::scientific << std::setprecision(10) << max_delta_u << std::endl;
-         // We'll write from the main loop where 't' is known.
-    }
+    // Store the max_delta_u value for use in write_output
+    current_max_delta_u = std::sqrt(max_delta_u_sq);
 }
 
 void Simulator::write_output(int time_step) {
-    std::string filename = output_dir + "/lbm_output_" + std::to_string(time_step) + ".dat"; // Changed extension to .dat
+    // Write simulation data to file with case-specific name
+    std::string case_name = get_case_name();
+    std::string model_name = get_collision_model_name();
+    std::string filename = output_dir + "/" + case_name + "_" + model_name + "_" + std::to_string(time_step) + ".dat";
     std::cout << "Writing output to " << filename << "..." << std::endl;
-    DataWriter::write_dat(filename, grid, nx, ny); // Changed function call
-
-    // Write convergence data here as well
-    Real max_delta_u_sq = 0.0;
-     for (int i = 0; i < nx; ++i) {
-        for (int j = 0; j < ny; ++j) {
-             if (grid[i][j].is_fluid) {
-                Real dux = grid[i][j].u.x - grid[i][j].u_old.x;
-                Real duy = grid[i][j].u.y - grid[i][j].u_old.y;
-                max_delta_u_sq = std::max(max_delta_u_sq, dux * dux + duy * duy);
-             }
-        }
-     }
-     Real max_delta_u = std::sqrt(max_delta_u_sq);
-      if (convergence_out.is_open()) {
-          convergence_out << time_step << " " << std::scientific << std::setprecision(10) << max_delta_u << std::endl;
-      }
-
+    DataWriter::write_dat(filename, grid, nx, ny);
 }

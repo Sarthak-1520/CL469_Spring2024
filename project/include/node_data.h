@@ -23,4 +23,6 @@ public:
     void compute_macroscopics(const Lattice& lattice);
     // Initialize f based on f_eq for given rho, u
     void initialize_equilibrium(const Lattice& lattice);
+    // Calculate equilibrium distribution for a specific direction
+    Real calculate_equilibrium(int k, const Lattice& lattice) const;
 };

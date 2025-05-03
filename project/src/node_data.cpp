@@ -40,3 +40,12 @@ void NodeData::initialize_equilibrium(const Lattice& lattice) {
      // Initialize f to f_eq
      f = f_eq;
 }
+
+Real NodeData::calculate_equilibrium(int k, const Lattice& lattice) const {
+    // Calculate polynomial equilibrium for direction k
+    Real u_sq = magnitude_sq(u);
+    Real cu = dot(lattice.get_c()[k], u);
+    Real cs2 = lattice.get_cs2();
+
+    return lattice.get_w()[k] * rho * (1.0 + cu / cs2 + 0.5 * (cu * cu) / (cs2 * cs2) - 0.5 * u_sq / cs2);
+}
