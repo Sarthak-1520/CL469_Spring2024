@@ -1,0 +1,18 @@
+# Simulation Parameters (Lattice Units)
+
+tau = 0.8
+nu = 0.1
+H = 11
+g = 9.203e-6
+rho0        = 1.0      # Initial density
+max_t_steps = 15000    # Total simulation time steps (e.g., > 10 * t_viscous)
+output_freq = 100      # Frequency to write data/check convergence
+collision_operator = BGK
+tau_minus = 1.0
+
+# Physical Parameters (for reference/conversion)
+Re_p        = 0.1531
+nu_p        = 1.0e-6
+H_p         = 5.0e-5
+g_p         = 9.8
+rho_p       = 1000.0 

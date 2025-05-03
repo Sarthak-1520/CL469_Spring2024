@@ -1,0 +1,10 @@
+# Final Results Summary
+H: 20
+Nx: 20
+Ny: 20
+tau: 0.8
+nu: 0.1
+g: 9.203e-06
+Collision Operator: BGK
+Final F_bottom_x_ME: 0.00165654
+Final F_top_x_ME: 0.00165654
